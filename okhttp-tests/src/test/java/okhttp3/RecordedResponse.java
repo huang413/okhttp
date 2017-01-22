@@ -154,6 +154,14 @@ public final class RecordedResponse {
     return this;
   }
 
+  public RecordedResponse assertFailureMatches(String... patterns) {
+    assertNotNull(failure);
+    for (String pattern : patterns) {
+      if (failure.getMessage().matches(pattern)) return this;
+    }
+    throw new AssertionError(failure.getMessage());
+  }
+
   public RecordedResponse assertSentRequestAtMillis(long minimum, long maximum) {
     assertDateInRange(minimum, response.sentRequestAtMillis(), maximum);
     return this;

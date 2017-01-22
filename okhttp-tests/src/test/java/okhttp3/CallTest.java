@@ -94,7 +94,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public final class CallTest {
-  @Rule public final TestRule timeout = new Timeout(30_000);
+  @Rule public final TestRule timeout = new Timeout(30_000, TimeUnit.MILLISECONDS);
   @Rule public final MockWebServer server = new MockWebServer();
   @Rule public final MockWebServer server2 = new MockWebServer();
   @Rule public final InMemoryFileSystem fileSystem = new InMemoryFileSystem();
@@ -1000,6 +1000,11 @@ public final class CallTest {
     executeSynchronously("/").assertBody("retry success");
   }
 
+  @Test public void recoverWhenRetryOnConnectionFailureIsTrue_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    recoverWhenRetryOnConnectionFailureIsTrue();
+  }
+
   @Test public void noRecoverWhenRetryOnConnectionFailureIsFalse() throws Exception {
     server.enqueue(new MockResponse().setBody("seed connection pool"));
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST));
@@ -1013,7 +1018,16 @@ public final class CallTest {
     executeSynchronously("/").assertBody("seed connection pool");
 
     // If this succeeds, too many requests were made.
-    executeSynchronously("/").assertFailure(IOException.class);
+    executeSynchronously("/")
+        .assertFailure(IOException.class)
+        .assertFailureMatches("stream was reset: CANCEL",
+            "unexpected end of stream on Connection.*"
+                + server.getHostName() + ":" + server.getPort() + ".*");
+  }
+
+  @Test public void recoverWhenRetryOnConnectionFailureIsFalse_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    noRecoverWhenRetryOnConnectionFailureIsFalse();
   }
 
   @Test public void recoverFromTlsHandshakeFailure() throws Exception {
@@ -1228,6 +1242,11 @@ public final class CallTest {
     RecordedRequest post2 = server.takeRequest();
     assertEquals("body!", post2.getBody().readUtf8());
     assertEquals(0, post2.getSequenceNumber());
+  }
+
+  @Test public void postBodyRetransmittedOnFailureRecovery_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    postBodyRetransmittedOnFailureRecovery();
   }
 
   @Test public void cacheHit() throws Exception {
@@ -2092,6 +2111,33 @@ public final class CallTest {
     executeSynchronously("/").assertBody("abcabcabc");
   }
 
+  @Test public void rangeHeaderPreventsAutomaticGzip() throws Exception {
+    Buffer gzippedBody = gzip("abcabcabc");
+
+    // Enqueue a gzipped response. Our request isn't expecting it, but that's okay.
+    server.enqueue(new MockResponse()
+        .setResponseCode(HttpURLConnection.HTTP_PARTIAL)
+        .setBody(gzippedBody)
+        .addHeader("Content-Encoding: gzip")
+        .addHeader("Content-Range: bytes 0-" + (gzippedBody.size() - 1)));
+
+    // Make a range request.
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .header("Range", "bytes=0-")
+        .build();
+    Call call = client.newCall(request);
+
+    // The response is not decompressed.
+    Response response = call.execute();
+    assertEquals("gzip", response.header("Content-Encoding"));
+    assertEquals(gzippedBody.snapshot(), response.body().source().readByteString());
+
+    // The request did not offer gzip support.
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertNull(recordedRequest.getHeader("Accept-Encoding"));
+  }
+
   @Test public void asyncResponseCanBeConsumedLater() throws Exception {
     server.enqueue(new MockResponse().setBody("abc"));
     server.enqueue(new MockResponse().setBody("def"));
@@ -2155,7 +2201,8 @@ public final class CallTest {
   }
 
   @Test public void expect100ContinueNonEmptyRequestBody() throws Exception {
-    server.enqueue(new MockResponse());
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.EXPECT_CONTINUE));
 
     Request request = new Request.Builder()
         .url(server.url("/"))
@@ -2182,6 +2229,88 @@ public final class CallTest {
     executeSynchronously(request)
         .assertCode(200)
         .assertSuccessful();
+  }
+
+  @Test public void expect100ContinueEmptyRequestBody_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    expect100ContinueEmptyRequestBody();
+  }
+
+  @Test public void expect100ContinueTimesOutWithoutContinue() throws Exception {
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.NO_RESPONSE));
+
+    client = client.newBuilder()
+        .readTimeout(500, TimeUnit.MILLISECONDS)
+        .build();
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .header("Expect", "100-continue")
+        .post(RequestBody.create(MediaType.parse("text/plain"), "abc"))
+        .build();
+
+    Call call = client.newCall(request);
+    try {
+      call.execute();
+      fail();
+    } catch (SocketTimeoutException expected) {
+    }
+
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertEquals("", recordedRequest.getBody().readUtf8());
+  }
+
+  @Test public void expect100ContinueTimesOutWithoutContinue_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    expect100ContinueTimesOutWithoutContinue();
+  }
+
+  @Test public void serverRespondsWithUnsolicited100Continue() throws Exception {
+    server.enqueue(new MockResponse()
+        .setStatus("HTTP/1.1 100 Continue"));
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .post(RequestBody.create(MediaType.parse("text/plain"), "abc"))
+        .build();
+
+    Call call = client.newCall(request);
+    Response response = call.execute();
+    assertEquals(100, response.code());
+    assertEquals("Continue", response.message());
+    assertEquals("", response.body().string());
+
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertEquals("abc", recordedRequest.getBody().readUtf8());
+  }
+
+  @Test public void serverRespondsWithUnsolicited100Continue_HTTP2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    serverRespondsWithUnsolicited100Continue();
+  }
+
+  @Test public void successfulExpectContinueAndConnectionReuse() throws Exception {
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.EXPECT_CONTINUE));
+    server.enqueue(new MockResponse());
+
+    executeSynchronously("/", "Expect", "100-continue");
+    executeSynchronously("/");
+
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+    assertEquals(1, server.takeRequest().getSequenceNumber());
+  }
+
+  @Test public void unsuccessfulExpectContinueAndConnectionReuse() throws Exception {
+    server.enqueue(new MockResponse());
+    server.enqueue(new MockResponse());
+
+    executeSynchronously("/", "Expect", "100-continue");
+    executeSynchronously("/");
+
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+    assertEquals(1, server.takeRequest().getSequenceNumber());
   }
 
   /** We forbid non-ASCII characters in outgoing request headers, but accept UTF-8. */
@@ -2500,6 +2629,46 @@ public final class CallTest {
 
     executeSynchronously("/")
         .assertFailure("Unexpected status line:  HTTP/1.1 200 OK");
+  }
+
+  @Test public void requestHeaderNameWithSpaceForbidden() throws Exception {
+    try {
+      new Request.Builder().addHeader("a b", "c");
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("Unexpected char 0x20 at 1 in header name: a b", expected.getMessage());
+    }
+  }
+
+  @Test public void requestHeaderNameWithTabForbidden() throws Exception {
+    try {
+      new Request.Builder().addHeader("a\tb", "c");
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("Unexpected char 0x09 at 1 in header name: a\tb", expected.getMessage());
+    }
+  }
+
+  @Test public void responseHeaderNameWithSpacePermitted() throws Exception {
+    server.enqueue(new MockResponse()
+        .clearHeaders()
+        .addHeader("content-length: 0")
+        .addHeaderLenient("a b", "c"));
+
+    Call call = client.newCall(new Request.Builder().url(server.url("/")).build());
+    Response response = call.execute();
+    assertEquals("c", response.header("a b"));
+  }
+
+  @Test public void responseHeaderNameWithTabPermitted() throws Exception {
+    server.enqueue(new MockResponse()
+        .clearHeaders()
+        .addHeader("content-length: 0")
+        .addHeaderLenient("a\tb", "c"));
+
+    Call call = client.newCall(new Request.Builder().url(server.url("/")).build());
+    Response response = call.execute();
+    assertEquals("c", response.header("a\tb"));
   }
 
   @Test public void connectFails() throws Exception {
